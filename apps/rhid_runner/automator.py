@@ -17,12 +17,14 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
     SessionNotCreatedException,
     StaleElementReferenceException,
     ElementClickInterceptedException,
+    ElementNotInteractableException,
 )
 
 # -----------------------------------------------------------------------------
@@ -66,6 +68,13 @@ LOGIN_BTN_SELECTORS = [
     (By.XPATH, "//button[normalize-space()='Entrar']"),
     (By.CSS_SELECTOR, "button[type='submit']"),
     (By.CSS_SELECTOR, "button.btn.m-btn.m-btn--custom"),
+]
+
+# Overlays/Spinners comuns que podem interceptar clique
+OVERLAY_SELECTORS = [
+    ".swal2-container", ".swal2-shown",
+    ".modal.in", ".modal-backdrop",
+    ".blockUI", ".block-overlay", ".loading", ".spinner", ".overlay",
 ]
 
 # -----------------------------------------------------------------------------
@@ -141,7 +150,7 @@ def type_with_retry(driver, locator, text, attempts=3, timeout_each=10):
                 el.click(); time.sleep(0.05); el.clear()
             el.send_keys(text)
             return
-        except (StaleElementReferenceException) as e:
+        except StaleElementReferenceException as e:
             last_exc = e; time.sleep(0.2); continue
         except Exception as e:
             last_exc = e; break
@@ -157,7 +166,110 @@ def type_with_retry(driver, locator, text, attempts=3, timeout_each=10):
     except Exception as e:
         raise last_exc or e
 
+def _wait_no_overlays(driver: webdriver.Chrome, timeout: int = 8) -> None:
+    """Espera sumirem overlays que possam interceptar cliques."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            present = False
+            for sel in OVERLAY_SELECTORS:
+                nodes = driver.find_elements(By.CSS_SELECTOR, sel)
+                for n in nodes:
+                    if n.is_displayed() and n.value_of_css_property("visibility") != "hidden":
+                        present = True
+                        break
+                if present:
+                    break
+            if not present:
+                return
+        except Exception:
+            pass
+        time.sleep(0.15)
+
+def _point_hits_element(driver: webdriver.Chrome, el) -> bool:
+    """Confere se o ponto central do elemento atinge o próprio elemento (não está coberto)."""
+    try:
+        rect = driver.execute_script("""
+            const r = arguments[0].getBoundingClientRect();
+            return {x: Math.floor(r.left + r.width/2), y: Math.floor(r.top + r.height/2), w:r.width, h:r.height};
+        """, el)
+        if rect["w"] <= 0 or rect["h"] <= 0:
+            return False
+        hit = driver.execute_script("""
+            const x = arguments[0], y = arguments[1], el = arguments[2];
+            const e = document.elementFromPoint(x, y);
+            return e === el || (e && el.contains(e));
+        """, rect["x"], rect["y"], el)
+        return bool(hit)
+    except Exception:
+        return False
+
+def robust_click(driver: webdriver.Chrome, el, *, timeout: int = 10) -> None:
+    """
+    Clique robusto:
+    - scroll até o centro,
+    - espera sumirem overlays,
+    - testa se ponto central atinge o elemento,
+    - tenta .click(), depois Actions, por fim JS click com MouseEvent.
+    """
+    end = time.time() + timeout
+    last_exc = None
+
+    while time.time() < end:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            _wait_no_overlays(driver, timeout=2)
+            time.sleep(0.05)
+
+            if (not el.is_displayed()) or (not el.is_enabled()):
+                time.sleep(0.2)
+                continue
+
+            if not _point_hits_element(driver, el):
+                # nudge leve para forçar repaint
+                ActionChains(driver).move_to_element_with_offset(el, 1, 1).perform()
+                time.sleep(0.1)
+                if not _point_hits_element(driver, el):
+                    time.sleep(0.15)
+                    continue
+
+            # 1) clique padrão
+            try:
+                el.click()
+                return
+            except (ElementClickInterceptedException, ElementNotInteractableException) as e:
+                last_exc = e
+
+            # 2) Actions
+            try:
+                ActionChains(driver).move_to_element(el).pause(0.05).click().perform()
+                return
+            except Exception as e:
+                last_exc = e
+
+            # 3) JS click
+            try:
+                driver.execute_script("""
+                    const el = arguments[0];
+                    el.focus({preventScroll:true});
+                    const evt = new MouseEvent('click', {bubbles:true, cancelable:true, view:window});
+                    el.dispatchEvent(evt);
+                """, el)
+                return
+            except Exception as e:
+                last_exc = e
+
+        except StaleElementReferenceException as e:
+            last_exc = e
+        except Exception as e:
+            last_exc = e
+
+        time.sleep(0.2)
+
+    raise last_exc or ElementNotInteractableException("Não foi possível clicar no elemento dentro do timeout.")
+
 def click_with_retry(driver, locators: Iterable[Tuple[str, str]], attempts=3, timeout_each=10):
+    """Mantido para cliques genéricos (não-críticos)."""
     last_exc = None
     for _ in range(attempts):
         for by, sel in locators:
@@ -404,15 +516,28 @@ def _registrar_ponto(driver: webdriver.Chrome) -> str:
         log.info("DRY RUN ativo — não clicarei no botão FINAL. URL: %s", driver.current_url)
         return "DRY RUN: cheguei ao botão final habilitado; clique final não executado."
 
-    # clicar
+    # 2.3 clicar (robusto)
     try:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", final_btn)
-        time.sleep(0.05)
-        final_btn.click()
+        # re-obter o botão mais fresco (evita stale após Angular re-render)
+        for by, sel in final_locators:
+            try:
+                final_btn = driver.find_element(by, sel)
+                break
+            except Exception:
+                pass
+
+        robust_click(driver, final_btn, timeout=10)
         log.info("CLIQUE executado no botão FINAL 'Registrar Ponto'.")
     except Exception:
-        click_with_retry(driver, final_locators, attempts=2, timeout_each=8)
-        log.info("CLIQUE (retry) executado no botão FINAL 'Registrar Ponto'.")
+        try:
+            for by, sel in final_locators:
+                el = WebDriverWait(driver, 3).until(EC.presence_of_element_located((by, sel)))
+                robust_click(driver, el, timeout=6)
+                log.info("CLIQUE (fallback) executado no botão FINAL.")
+                break
+        except Exception as e:
+            _screenshot(driver)
+            raise
 
     # confirmação
     try:
@@ -438,15 +563,10 @@ def _registrar_ponto(driver: webdriver.Chrome) -> str:
 # -----------------------------------------------------------------------------
 # Entry point usado pelo bot do Discord
 # -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# Entry point usado pelo bot do Discord
-# -----------------------------------------------------------------------------
 def run_rhid_punch(trigger: str = "manual", discord_user: Optional[dict] = None):
     """
     Retorna um dict pronto para o Discord:
       {"content": "", "embeds": [ ... ]}
-
-    (compatível com o envio de embed via discord.py)
     """
     driver: Optional[webdriver.Chrome] = None
     started_at = datetime.now(timezone.utc)
@@ -469,9 +589,7 @@ def run_rhid_punch(trigger: str = "manual", discord_user: Optional[dict] = None)
         modo = "DRY RUN (simulação)" if PUNCH_DRY_RUN else "Produção"
         etapas = "login → dashboard → marcação → botão final habilitado ✔"
 
-        # heuristicazinha de “sucesso”
-        ok = True  # chegamos até aqui sem exception
-        color = 0x2ECC71 if ok else 0xE67E22  # verde ou laranja
+        color = 0x2ECC71  # verde sucesso
 
         fields = [
             {"name": "Horário", "value": hora, "inline": True},
@@ -492,17 +610,11 @@ def run_rhid_punch(trigger: str = "manual", discord_user: Optional[dict] = None)
             "description": "Rotina de marcação de ponto",
             "color": color,
             "fields": fields,
-            "footer": {
-                "text": f"Trigger: {trigger}"
-            },
+            "footer": { "text": f"Trigger: {trigger}" },
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
 
-        # opcional: ícone da marca (coloque um URL se quiser)
-        # embed["thumbnail"] = {"url": "https://<seu-icon>.png"}
-
-        # Retorno no formato que o bot entende para enviar um card
-        return {"content": "", "embeds": [embed]}
+        return {"content": "", "embeds": [embed], "maps_url": maps_link}
 
     except TimeoutException as e:
         log.exception("Timeout no fluxo RHID")
