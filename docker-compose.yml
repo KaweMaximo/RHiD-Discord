@@ -1,0 +1,19 @@
+# docker-compose.yml (Compose v2 – sem "version")
+services:
+  rhid-discord-puncher:
+    build:
+      context: .               # pasta do projeto (onde está o Dockerfile)
+      dockerfile: Dockerfile   # ajuste se o nome/caminho for outro
+    container_name: rhid-discord-puncher
+    env_file:
+      - .env                   # suas variáveis (TOKEN do Discord, RHID_URL, etc.)
+    environment:
+      - HEADLESS=true
+      - CHROME_USER_DATA_BASE=/tmp/rhid-chrome
+      - RHID_USE_USER_DATA=0   # NÃO usar --user-data-dir (evita lock)
+    shm_size: "2gb"            # Chrome estável no Docker
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+    # Se o seu Dockerfile já define CMD/ENTRYPOINT, remova a linha abaixo
+    # command: python -m apps.discord-bot.main
